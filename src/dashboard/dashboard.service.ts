@@ -17,7 +17,7 @@ import {
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { OperationalActor } from '../common/utils/operational-access';
-import { assertManagementUnitAccess } from '../common/utils/management-scope';
+import { assertManagementUnitAccess, resourceManagementUnitIds } from '../common/utils/management-scope';
 
 @Injectable()
 export class DashboardService {
@@ -25,18 +25,25 @@ export class DashboardService {
 
   async getManagerDashboard(managementUnitId: number, date: string | undefined, actor: OperationalActor) {
     const managementUnit = await assertManagementUnitAccess(this.prisma, actor, managementUnitId);
+    const unitIds = await resourceManagementUnitIds(this.prisma, managementUnitId);
     const selectedDate = date ? new Date(`${date}T00:00:00`) : new Date();
     if (Number.isNaN(selectedDate.getTime())) throw new Error('Ngày dashboard không hợp lệ.');
     const dayStart = new Date(selectedDate); dayStart.setHours(0, 0, 0, 0);
     const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
     const activeAt = new Date();
-    const workWhere = { managementUnitId, plannedStartAt: { lt: dayEnd }, plannedEndAt: { gte: dayStart } };
+    const workWhere = { managementUnitId: { in: unitIds }, plannedStartAt: { lt: dayEnd }, plannedEndAt: { gte: dayStart } };
     const [drivers, vehicles, todayWork, pendingReports, alerts, manager] = await Promise.all([
-      this.prisma.driverManagementAssignment.count({ where: { managementUnitId, effectiveFrom: { lte: activeAt }, OR: [{ effectiveTo: null }, { effectiveTo: { gt: activeAt } }] } }),
-      this.prisma.vehicle.count({ where: { managementUnitId } }),
+      this.prisma.driverProfile.count({ where: { OR: [
+        { managementAssignments: { some: { effectiveFrom: { lte: activeAt }, AND: [
+          { OR: [{ effectiveTo: null }, { effectiveTo: { gt: activeAt } }] },
+          { OR: [{ managementUnitId: { in: unitIds } }, { teamUnitId: { in: unitIds } }] },
+        ] } } },
+        { vehicleAssignments: { some: { status: 'ACTIVE', vehicle: { managementUnitId: { in: unitIds } } } } },
+      ] } }),
+      this.prisma.vehicle.count({ where: { managementUnitId: { in: unitIds } } }),
       this.prisma.operationalWorkOrder.count({ where: { ...workWhere, status: { notIn: [WorkOrderStatus.CANCELLED, WorkOrderStatus.CLOSED] } } }),
-      this.prisma.dailyReport.count({ where: { workOrder: { managementUnitId }, status: { in: [DailyReportStatus.DRAFT, DailyReportStatus.SUBMITTED_ON_TIME, DailyReportStatus.LATE] } } }),
-      this.prisma.alertEvent.count({ where: { managementUnitId, status: { in: [AlertStatus.OPEN, AlertStatus.IN_PROGRESS] } } }),
+      this.prisma.dailyReport.count({ where: { workOrder: { managementUnitId: { in: unitIds } }, status: { in: [DailyReportStatus.DRAFT, DailyReportStatus.SUBMITTED_ON_TIME, DailyReportStatus.LATE] } } }),
+      this.prisma.alertEvent.count({ where: { managementUnitId: { in: unitIds }, status: { in: [AlertStatus.OPEN, AlertStatus.IN_PROGRESS] } } }),
       this.prisma.managementUnitManagerAssignment.findFirst({
         where: { managementUnitId, managerType: 'PRIMARY', effectiveFrom: { lte: activeAt }, OR: [{ effectiveTo: null }, { effectiveTo: { gt: activeAt } }] },
         include: { manager: { select: { id: true, code: true, fullName: true, phone: true } } },
@@ -49,6 +56,7 @@ export class DashboardService {
   async getExecutiveOverview(unit?: Unit, complexCode?: string, managementUnitId?: number, actor?: OperationalActor) {
     if (actor?.role === Role.FARM_MANAGER && !managementUnitId) throw new BadRequestException('Đội trưởng phải chọn một khu vực quản lý.');
     if (managementUnitId && actor) await assertManagementUnitAccess(this.prisma, actor, managementUnitId);
+    const managementUnitIds = managementUnitId ? await resourceManagementUnitIds(this.prisma, managementUnitId) : undefined;
     const vehicleWhere: any = {};
     const planWhere: any = {};
     const transportWhere: any = {};
@@ -60,7 +68,8 @@ export class DashboardService {
     if (complexCode && complexCode !== 'ALL') {
       vehicleWhere.complexCode = complexCode;
     }
-    if (managementUnitId) vehicleWhere.managementUnitId = managementUnitId;
+    if (managementUnitIds) vehicleWhere.managementUnitId = { in: managementUnitIds };
+    const implementWhere = managementUnitIds ? { managementUnitId: { in: managementUnitIds } } : {};
 
     const [
       totalVehicles,
@@ -88,8 +97,8 @@ export class DashboardService {
       this.prisma.vehicle.count({ where: { ...vehicleWhere, status: VehicleStatus.TAM_DUNG } }),
       this.prisma.vehicle.count({ where: { ...vehicleWhere, status: VehicleStatus.BAO_DUONG } }),
       this.prisma.vehicle.count({ where: { ...vehicleWhere, status: VehicleStatus.SUA_CHUA } }),
-      this.prisma.agriculturalImplement.count(),
-      this.prisma.agriculturalImplement.count({ where: { status: ImplementStatus.ATTACHED } }),
+      this.prisma.agriculturalImplement.count({ where: implementWhere }),
+      this.prisma.agriculturalImplement.count({ where: { ...implementWhere, status: ImplementStatus.ATTACHED } }),
       this.prisma.productionPlan.count({ where: planWhere }),
       this.prisma.productionPlan.count({ where: { ...planWhere, status: PlanStatus.IN_PROGRESS } }),
       this.prisma.productionPlan.count({ where: { ...planWhere, status: PlanStatus.COMPLETED } }),
@@ -178,6 +187,7 @@ export class DashboardService {
   async getLiveFleetMap(unit?: Unit, complexCode?: string, managementUnitId?: number, actor?: OperationalActor) {
     if (actor?.role === Role.FARM_MANAGER && !managementUnitId) throw new BadRequestException('Đội trưởng phải chọn một khu vực quản lý.');
     if (managementUnitId && actor) await assertManagementUnitAccess(this.prisma, actor, managementUnitId);
+    const managementUnitIds = managementUnitId ? await resourceManagementUnitIds(this.prisma, managementUnitId) : undefined;
     const where: any = {};
     if (unit && unit !== Unit.TOAN_KLH) {
       where.unit = unit;
@@ -185,7 +195,7 @@ export class DashboardService {
     if (complexCode && complexCode !== 'ALL') {
       where.complexCode = complexCode;
     }
-    if (managementUnitId) where.managementUnitId = managementUnitId;
+    if (managementUnitIds) where.managementUnitId = { in: managementUnitIds };
 
     return this.prisma.vehicle.findMany({
       where,
