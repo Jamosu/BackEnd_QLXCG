@@ -412,7 +412,7 @@ export class UsersService {
         if (filter.complex || filter.complexCode) {
           const reqComp = (filter.complex || filter.complexCode || '').trim().toUpperCase();
           if (reqComp !== 'ALL') {
-            const itemComp = this.resolveDriverComplexCode(item);
+            const itemComp = item.complex || this.resolveDriverComplexCode(item);
             const isMatch =
               itemComp === reqComp ||
               (reqComp === 'KOUN_MOM' && itemComp === 'KOUN_MOM') ||
@@ -486,8 +486,16 @@ export class UsersService {
 
   async getDriverProfileOptions(actor: OperationalActor) {
     const allowedManagementUnitIds = await scopedManagementUnitIds(this.prisma, actor);
+    const [managedDrivers, teamUnits] = actor.role === Role.FARM_MANAGER
+      ? await Promise.all([
+          this.prisma.user.findMany({ where: await this.scopedDriverWhere(actor, allowedManagementUnitIds ?? []), select: { code: true } }),
+          this.prisma.driverManagementUnit.findMany({ where: { id: { in: allowedManagementUnitIds ?? [] }, level: DriverManagementLevel.TEAM }, select: { parentId: true } }),
+        ])
+      : [null, []];
+    const parentUnitIds = teamUnits.flatMap((unit) => unit.parentId ? [unit.parentId] : []);
     const [employees, vehicles, managementUnits] = await Promise.all([
       this.prisma.employeeRecord.findMany({
+        where: managedDrivers ? { empCode: { in: managedDrivers.map((driver) => driver.code) } } : {},
         select: {
           complex: true,
           businessUnit: true,
@@ -507,7 +515,7 @@ export class UsersService {
             where: {
               status: 'ACTIVE',
               ...(actor.role === Role.FARM_MANAGER
-                ? { OR: [{ id: { in: allowedManagementUnitIds ?? [] } }, { parentId: { in: allowedManagementUnitIds ?? [] } }] }
+                ? { OR: [{ id: { in: [...(allowedManagementUnitIds ?? []), ...parentUnitIds] } }, { parentId: { in: allowedManagementUnitIds ?? [] } }] }
                 : {}),
             },
             include: {
