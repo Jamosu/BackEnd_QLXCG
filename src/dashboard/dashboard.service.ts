@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import {
   ImplementStatus,
   MaintenanceAlertTier,
@@ -10,14 +10,45 @@ import {
   TransportStatus,
   Unit,
   VehicleStatus,
+  AlertStatus,
+  DailyReportStatus,
+  WorkOrderStatus,
+  Role,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { OperationalActor } from '../common/utils/operational-access';
+import { assertManagementUnitAccess } from '../common/utils/management-scope';
 
 @Injectable()
 export class DashboardService {
   constructor(private prisma: PrismaService) {}
 
-  async getExecutiveOverview(unit?: Unit, complexCode?: string) {
+  async getManagerDashboard(managementUnitId: number, date: string | undefined, actor: OperationalActor) {
+    const managementUnit = await assertManagementUnitAccess(this.prisma, actor, managementUnitId);
+    const selectedDate = date ? new Date(`${date}T00:00:00`) : new Date();
+    if (Number.isNaN(selectedDate.getTime())) throw new Error('Ngày dashboard không hợp lệ.');
+    const dayStart = new Date(selectedDate); dayStart.setHours(0, 0, 0, 0);
+    const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate() + 1);
+    const activeAt = new Date();
+    const workWhere = { managementUnitId, plannedStartAt: { lt: dayEnd }, plannedEndAt: { gte: dayStart } };
+    const [drivers, vehicles, todayWork, pendingReports, alerts, manager] = await Promise.all([
+      this.prisma.driverManagementAssignment.count({ where: { managementUnitId, effectiveFrom: { lte: activeAt }, OR: [{ effectiveTo: null }, { effectiveTo: { gt: activeAt } }] } }),
+      this.prisma.vehicle.count({ where: { managementUnitId } }),
+      this.prisma.operationalWorkOrder.count({ where: { ...workWhere, status: { notIn: [WorkOrderStatus.CANCELLED, WorkOrderStatus.CLOSED] } } }),
+      this.prisma.dailyReport.count({ where: { workOrder: { managementUnitId }, status: { in: [DailyReportStatus.DRAFT, DailyReportStatus.SUBMITTED_ON_TIME, DailyReportStatus.LATE] } } }),
+      this.prisma.alertEvent.count({ where: { managementUnitId, status: { in: [AlertStatus.OPEN, AlertStatus.IN_PROGRESS] } } }),
+      this.prisma.managementUnitManagerAssignment.findFirst({
+        where: { managementUnitId, managerType: 'PRIMARY', effectiveFrom: { lte: activeAt }, OR: [{ effectiveTo: null }, { effectiveTo: { gt: activeAt } }] },
+        include: { manager: { select: { id: true, code: true, fullName: true, phone: true } } },
+        orderBy: { effectiveFrom: 'desc' },
+      }),
+    ]);
+    return { managementUnit, date: dayStart, manager: manager?.manager ?? null, kpis: { drivers, vehicles, todayWork, pendingReports, alerts } };
+  }
+
+  async getExecutiveOverview(unit?: Unit, complexCode?: string, managementUnitId?: number, actor?: OperationalActor) {
+    if (actor?.role === Role.FARM_MANAGER && !managementUnitId) throw new BadRequestException('Đội trưởng phải chọn một khu vực quản lý.');
+    if (managementUnitId && actor) await assertManagementUnitAccess(this.prisma, actor, managementUnitId);
     const vehicleWhere: any = {};
     const planWhere: any = {};
     const transportWhere: any = {};
@@ -29,10 +60,12 @@ export class DashboardService {
     if (complexCode && complexCode !== 'ALL') {
       vehicleWhere.complexCode = complexCode;
     }
+    if (managementUnitId) vehicleWhere.managementUnitId = managementUnitId;
 
     const [
       totalVehicles,
       runningVehicles,
+      readyVehicles,
       standbyVehicles,
       maintenanceVehicles,
       repairVehicles,
@@ -47,9 +80,11 @@ export class DashboardService {
       activeRepairsCount,
       activeTransportTrips,
       activeSosAlerts,
+      gpsEquippedCount,
     ] = await Promise.all([
       this.prisma.vehicle.count({ where: vehicleWhere }),
       this.prisma.vehicle.count({ where: { ...vehicleWhere, status: VehicleStatus.HOAT_DONG } }),
+      this.prisma.vehicle.count({ where: { ...vehicleWhere, status: VehicleStatus.CHO_PHAN_CONG } }),
       this.prisma.vehicle.count({ where: { ...vehicleWhere, status: VehicleStatus.TAM_DUNG } }),
       this.prisma.vehicle.count({ where: { ...vehicleWhere, status: VehicleStatus.BAO_DUONG } }),
       this.prisma.vehicle.count({ where: { ...vehicleWhere, status: VehicleStatus.SUA_CHUA } }),
@@ -69,8 +104,8 @@ export class DashboardService {
       this.prisma.vehicle.count({
         where: { ...vehicleWhere, alertTier: MaintenanceAlertTier.RED },
       }),
-      this.prisma.repairTicket.count({
-        where: { status: { in: [RepairStatus.RECEIVED, RepairStatus.IN_REPAIR, RepairStatus.WAITING_PARTS] } },
+      this.prisma.workshopRequest.count({
+        where: { type: 'REPAIR', status: { notIn: ['COMPLETED', 'CANCELLED'] } },
       }),
       this.prisma.transportOrder.count({
         where: { ...transportWhere, status: { in: [TransportStatus.DEPARTED, TransportStatus.IN_TRANSIT, TransportStatus.AT_DELIVERY, TransportStatus.UNLOADING] } },
@@ -78,10 +113,19 @@ export class DashboardService {
       this.prisma.driverSosAlert.count({
         where: { status: SosStatus.PENDING },
       }),
+      this.prisma.vehicle.count({
+        where: {
+          ...vehicleWhere,
+          AND: [{ gpsImei: { not: null } }, { gpsImei: { not: '' } }],
+        },
+      }),
     ]);
 
+    const gpsEquippedVehicles = gpsEquippedCount || 0;
+    const noGpsVehicles = Math.max(0, totalVehicles - gpsEquippedVehicles);
+
     const availabilityRate = totalVehicles > 0
-      ? (((runningVehicles + standbyVehicles) / totalVehicles) * 100).toFixed(1)
+      ? (((runningVehicles + readyVehicles) / totalVehicles) * 100).toFixed(1)
       : '0';
 
     return {
@@ -90,10 +134,14 @@ export class DashboardService {
         totalFleet: {
           total: totalVehicles,
           running: runningVehicles,
+          ready: readyVehicles,
           standby: standbyVehicles,
+          stopped: standbyVehicles,
           maintenance: maintenanceVehicles,
           repair: repairVehicles,
           availabilityRate: `${availabilityRate}%`,
+          gpsEquipped: gpsEquippedVehicles,
+          noGps: noGpsVehicles,
         },
         agriculturalProgress: {
           totalPlans,
@@ -127,11 +175,17 @@ export class DashboardService {
     };
   }
 
-  async getLiveFleetMap(unit?: Unit) {
+  async getLiveFleetMap(unit?: Unit, complexCode?: string, managementUnitId?: number, actor?: OperationalActor) {
+    if (actor?.role === Role.FARM_MANAGER && !managementUnitId) throw new BadRequestException('Đội trưởng phải chọn một khu vực quản lý.');
+    if (managementUnitId && actor) await assertManagementUnitAccess(this.prisma, actor, managementUnitId);
     const where: any = {};
     if (unit && unit !== Unit.TOAN_KLH) {
       where.unit = unit;
     }
+    if (complexCode && complexCode !== 'ALL') {
+      where.complexCode = complexCode;
+    }
+    if (managementUnitId) where.managementUnitId = managementUnitId;
 
     return this.prisma.vehicle.findMany({
       where,
@@ -142,6 +196,9 @@ export class DashboardService {
         name: true,
         category: true,
         unit: true,
+        assignedUnitCode: true,
+        regionCode: true,
+        gpsImei: true,
         status: true,
         alertTier: true,
         totalMachineHours: true,
@@ -158,6 +215,7 @@ export class DashboardService {
           select: { id: true, code: true, name: true, category: true },
         },
       },
+      orderBy: { id: 'asc' },
     });
   }
 }

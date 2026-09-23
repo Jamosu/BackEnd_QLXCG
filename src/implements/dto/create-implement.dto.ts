@@ -1,6 +1,7 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { ImplementCategory, ImplementStatus, TechnicalCondition, Unit } from '@prisma/client';
-import { IsEnum, IsNotEmpty, IsOptional, IsString } from 'class-validator';
+import { EquipmentUsageMode, ImplementCategory, ImplementStatus, TechnicalCondition, Unit } from '@prisma/client';
+import { Type } from 'class-transformer';
+import { IsArray, IsEnum, IsInt, IsNotEmpty, IsOptional, IsString } from 'class-validator';
 
 export class CreateImplementDto {
   @ApiProperty({ example: 'TB-DC-04', description: 'Mã nông cụ' })
@@ -17,7 +18,7 @@ export class CreateImplementDto {
   @IsEnum(ImplementCategory)
   category: ImplementCategory;
 
-  @ApiPropertyOptional({ enum: Unit, default: Unit.BAN_CO_GIOI })
+  @ApiPropertyOptional({ enum: Unit, default: Unit.KOUN_MOM })
   @IsOptional()
   @IsEnum(Unit)
   unit?: Unit;
@@ -51,4 +52,26 @@ export class CreateImplementDto {
   @IsOptional()
   @IsString()
   managerPhone?: string;
+
+  @ApiPropertyOptional({ enum: EquipmentUsageMode, default: EquipmentUsageMode.UNCLASSIFIED })
+  @IsOptional()
+  @IsEnum(EquipmentUsageMode)
+  usageMode?: EquipmentUsageMode;
+
+  @ApiPropertyOptional({ description: 'Tên nhóm gốc trong workbook' })
+  @IsOptional()
+  @IsString()
+  sourceGroup?: string;
+
+  @ApiPropertyOptional({ example: 'CGTC DP', description: 'Đơn vị sử dụng theo workbook' })
+  @IsOptional()
+  @IsString()
+  assignedUnitCode?: string;
+
+  @ApiPropertyOptional({ type: [Number], description: 'Các VehicleType được phép gắn thiết bị này' })
+  @IsOptional()
+  @IsArray()
+  @Type(() => Number)
+  @IsInt({ each: true })
+  compatibleVehicleTypeIds?: number[];
 }

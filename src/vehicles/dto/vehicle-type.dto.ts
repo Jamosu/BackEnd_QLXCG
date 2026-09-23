@@ -1,5 +1,10 @@
 import { ApiProperty, ApiPropertyOptional, PartialType } from '@nestjs/swagger';
-import { FuelQuotaUnit, VehicleCategory } from '@prisma/client';
+import {
+  FuelQuotaUnit,
+  ImplementRequirement,
+  VehicleCategory,
+  VehicleOperationalDomain,
+} from '@prisma/client';
 import { Transform, Type } from 'class-transformer';
 import {
   IsBoolean,
@@ -32,6 +37,21 @@ export class CreateVehicleTypeDto {
   @IsOptional()
   @IsEnum(VehicleCategory)
   category?: VehicleCategory;
+
+  @ApiPropertyOptional({ enum: VehicleOperationalDomain })
+  @IsOptional()
+  @IsEnum(VehicleOperationalDomain)
+  operationalDomain?: VehicleOperationalDomain;
+
+  @ApiPropertyOptional({ enum: ImplementRequirement, default: ImplementRequirement.NONE })
+  @IsOptional()
+  @IsEnum(ImplementRequirement)
+  implementRequirement?: ImplementRequirement;
+
+  @ApiPropertyOptional({ default: true })
+  @IsOptional()
+  @IsBoolean()
+  isAssignable?: boolean;
 
   @ApiPropertyOptional({ example: 250, default: 250 })
   @IsOptional()
@@ -73,8 +93,12 @@ export class VehicleTypeFilterDto {
 
   @ApiPropertyOptional({ example: true })
   @IsOptional()
-  @Transform(({ value }) => value === true || value === 'true')
-  @IsBoolean()
+  @Transform(({ obj, key }) => {
+    const raw = obj ? obj[key] : undefined;
+    if (raw === 'true' || raw === true || raw === 1 || raw === '1') return true;
+    if (raw === 'false' || raw === false || raw === 0 || raw === '0') return false;
+    return undefined;
+  })
   active?: boolean;
 
   @ApiPropertyOptional({ example: 1 })

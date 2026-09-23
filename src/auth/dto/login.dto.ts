@@ -7,9 +7,9 @@ export class LoginDto {
   @IsString()
   username: string;
 
-  @ApiProperty({ example: '123456', description: 'Mật khẩu' })
+  @ApiProperty({ example: 'Thaco@1234$', description: 'Mật khẩu' })
   @IsNotEmpty({ message: 'Mật khẩu không được để trống' })
   @IsString()
-  @MinLength(6, { message: 'Mật khẩu phải có ít nhất 6 ký tự' })
+  @MinLength(3, { message: 'Mật khẩu phải có ít nhất 3 ký tự' })
   password: string;
 }

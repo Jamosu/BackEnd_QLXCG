@@ -1,44 +1,67 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, Optional } from '@nestjs/common';
 import {
   DriverEmploymentStatus,
+  DriverManagementLevel,
+  DriverManagementUnitStatus,
   DriverShiftStatus,
+  Prisma,
   Role,
   Unit,
+  VehicleDriverAssignmentStatus,
+  VehicleDriverAssignmentType,
 } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
 import { PrismaService } from '../prisma/prisma.service';
+import { UserPresenceService } from './user-presence.service';
 import { CreateDriverProfileDto } from './dto/create-driver-profile.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { DriverProfileFilterDto } from './dto/driver-profile-filter.dto';
 import { UpdateDriverProfileDto } from './dto/update-driver-profile.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
+import { hasGlobalOperationalAccess, OperationalActor } from '../common/utils/operational-access';
+import { scopedManagementUnitIds } from '../common/utils/management-scope';
+import { getDriverComplianceStatus, resolveDriverComplianceFields } from './driver-compliance';
+import { AlertsService } from '../alerts/alerts.service';
 
 @Injectable()
 export class UsersService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private userPresenceService: UserPresenceService,
+    @Optional() private readonly alertsService?: AlertsService,
+  ) {}
 
-  private getComplianceStatus(
-    licenseNumber?: string | null,
-    licenseExpiryDate?: Date | null,
-    healthCheckExpiryDate?: Date | null,
+  private async resolveDriverManagementSelection(
+    managementUnitId: number | undefined,
+    teamUnitId: number | undefined,
+    actor: OperationalActor,
+    requireForFarmManager = false,
   ) {
-    if (!licenseNumber || !licenseExpiryDate || !healthCheckExpiryDate) {
-      return 'MISSING';
+    if (!managementUnitId) {
+      if (teamUnitId) throw new BadRequestException('Phải chọn đơn vị chủ quản trước khi chọn Đội/Tổ.');
+      if (requireForFarmManager && actor.role === Role.FARM_MANAGER) {
+        throw new BadRequestException('Quản lý đơn vị phải chọn đơn vị chủ quản trong phạm vi được cấp.');
+      }
+      return null;
     }
 
-    const now = new Date();
-    now.setHours(0, 0, 0, 0);
-    const expiryDates = [licenseExpiryDate, healthCheckExpiryDate];
-    const remainingDays = Math.min(
-      ...expiryDates.map((date) =>
-        Math.ceil((new Date(date).getTime() - now.getTime()) / 86400000),
-      ),
-    );
-
-    if (remainingDays < 0) return 'EXPIRED';
-    if (remainingDays <= 30) return 'EXPIRING_30';
-    if (remainingDays <= 60) return 'EXPIRING_60';
-    return 'VALID';
+    const owner = await this.prisma.driverManagementUnit.findUnique({ where: { id: managementUnitId } });
+    if (!owner || owner.level !== DriverManagementLevel.OWNER || owner.status !== DriverManagementUnitStatus.ACTIVE) {
+      throw new BadRequestException('Đơn vị chủ quản không hợp lệ hoặc đã ngừng hoạt động.');
+    }
+    if (teamUnitId) {
+      const team = await this.prisma.driverManagementUnit.findUnique({ where: { id: teamUnitId } });
+      if (!team || team.level !== DriverManagementLevel.TEAM || team.parentId !== owner.id || team.status !== DriverManagementUnitStatus.ACTIVE) {
+        throw new BadRequestException('Đội/Tổ không hợp lệ hoặc không trực thuộc đơn vị đã chọn.');
+      }
+    }
+    if (actor.role === Role.FARM_MANAGER) {
+      const scopes = await this.prisma.driverManagementAccessScope.findMany({ where: { userId: actor.id, complexCode: owner.complexCode, canAssignDrivers: true } });
+      if (!scopes.some((scope) => !scope.managementUnitId || scope.managementUnitId === owner.id)) {
+        throw new ForbiddenException('Đơn vị nằm ngoài phạm vi phân công tài xế được cấp.');
+      }
+    }
+    return { owner, teamUnitId: teamUnitId || null };
   }
 
   async create(dto: CreateUserDto) {
@@ -99,7 +122,7 @@ export class UsersService {
       ];
     }
 
-    return this.prisma.user.findMany({
+    const users = await this.prisma.user.findMany({
       where,
       select: {
         id: true,
@@ -128,17 +151,78 @@ export class UsersService {
       },
       orderBy: { id: 'asc' },
     });
+
+    return users.map((u) => {
+      const presence = this.userPresenceService.getPresence(u.id);
+      return {
+        ...u,
+        isOnline: u.isActive ? presence.isOnline : false,
+        lastSeenAt: presence.lastSeenAt || u.createdAt,
+        onlinePlatform: presence.platform,
+      };
+    });
   }
 
   async findDrivers(unit?: Unit) {
     return this.findAll(Role.DRIVER, unit);
   }
 
-  async findDriverProfiles(filter: DriverProfileFilterDto) {
+  resolveDriverComplexCode(driver: any): 'KOUN_MOM' | 'SNOUL' | 'NAM_LAO' {
+    // 1. Theo đơn vị chủ quản quản lý trực tiếp
+    const mgmtComp = (driver.managementUnit?.complexCode || driver.managementAssignment?.managementUnit?.complexCode || '').toUpperCase();
+    if (mgmtComp) {
+      if (mgmtComp.includes('KOUN') || mgmtComp === 'KM' || mgmtComp === 'KOUN_MOM') return 'KOUN_MOM';
+      if (mgmtComp.includes('SNOUL') || mgmtComp === 'SN') return 'SNOUL';
+      if (mgmtComp.includes('LAO') || mgmtComp === 'NL' || mgmtComp === 'NAM_LAO') return 'NAM_LAO';
+    }
+
+    // 2. Theo tiền tố mã tài xế
+    const code = (driver.code || '').toUpperCase();
+    if (code.startsWith('NL-') || code.startsWith('TX-NL') || code.includes('-NL-') || code.startsWith('NL_')) return 'NAM_LAO';
+    if (code.startsWith('SN-') || code.startsWith('TX-SN') || code.includes('-SN-') || code.startsWith('SN_')) return 'SNOUL';
+    if (code.startsWith('KM-') || code.startsWith('TX-KM') || code.includes('-KM-') || code.startsWith('KM_')) return 'KOUN_MOM';
+
+    // 3. Theo username
+    const username = (driver.username || '').toLowerCase();
+    if (username.startsWith('nl_') || username.includes('namlao')) return 'NAM_LAO';
+    if (username.startsWith('sn_') || username.includes('snoul')) return 'SNOUL';
+    if (username.startsWith('km_') || username.includes('kounmom')) return 'KOUN_MOM';
+
+    // 4. Theo businessUnit trong hồ sơ nhân sự
+    const bu = (driver.employee?.businessUnit || '').toUpperCase();
+    if (bu.includes('LAO') || bu.includes('ATTAPEU')) return 'NAM_LAO';
+    if (bu.includes('SNOUL')) return 'SNOUL';
+    if (bu.includes('KOUN') || bu.includes('LUMPHAT') || bu.includes('IA PUCH')) return 'KOUN_MOM';
+
+    // 5. Theo employee.complex
+    const empComp = (driver.employee?.complex || '').toUpperCase();
+    if (empComp.includes('LAO') || empComp === 'NL' || empComp === 'NAM_LAO') return 'NAM_LAO';
+    if (empComp.includes('SNOUL') || empComp === 'SN') return 'SNOUL';
+    if (empComp.includes('KOUN') || empComp === 'KM' || empComp === 'KOUN_MOM') return 'KOUN_MOM';
+
+    return 'KOUN_MOM';
+  }
+
+  async findDriverProfiles(filter: DriverProfileFilterDto, actor: OperationalActor) {
     const { page = 1, limit = 20 } = filter;
+    const allowedManagementUnitIds = actor.role === Role.FARM_MANAGER
+      ? await scopedManagementUnitIds(this.prisma, actor)
+      : null;
+    const allowedManagementUnitIdSet = new Set(allowedManagementUnitIds ?? []);
+    if (actor.role === Role.FARM_MANAGER && filter.managementUnitId && !allowedManagementUnitIdSet.has(filter.managementUnitId)) {
+      throw new ForbiddenException('Không được xem hồ sơ tài xế ngoài khu vực được giao.');
+    }
+    if (filter.unit && !hasGlobalOperationalAccess(actor) && filter.unit !== actor.unit) {
+      throw new ForbiddenException('Không được xem hồ sơ tài xế ngoài đơn vị được phân quyền.');
+    }
+    const driverWhere = actor.role === Role.DRIVER
+      ? { role: Role.DRIVER, id: actor.id }
+      : actor.role === Role.FARM_MANAGER
+        ? { role: Role.DRIVER }
+      : { role: Role.DRIVER, ...(!hasGlobalOperationalAccess(actor) ? { unit: actor.unit } : {}) };
     const [drivers, employeeRecords] = await Promise.all([
       this.prisma.user.findMany({
-        where: { role: Role.DRIVER },
+        where: driverWhere,
         select: {
           id: true,
           code: true,
@@ -162,9 +246,15 @@ export class UsersService {
               employmentStatus: true, joinedDate: true, resignedDate: true, resignedReason: true,
               licenseClass: true, licenseNumber: true, licenseExpiryDate: true, healthCheckExpiryDate: true,
               currentShiftStatus: true, currentLocation: true,
+              licensesJson: true,
               vehicleAssignments: {
-                where: { status: 'ACTIVE', type: 'PRIMARY' },
+                where: { status: 'ACTIVE' },
                 include: { vehicle: true },
+                orderBy: { effectiveFrom: 'desc' },
+              },
+              managementAssignments: {
+                where: { effectiveFrom: { lte: new Date() }, OR: [{ effectiveTo: null }, { effectiveTo: { gt: new Date() } }] },
+                include: { managementUnit: true, teamUnit: true },
                 orderBy: { effectiveFrom: 'desc' }, take: 1,
               },
             },
@@ -198,56 +288,120 @@ export class UsersService {
     ]);
 
     const employeeByCode = new Map(employeeRecords.map((item) => [item.empCode, item]));
+    const allManagementUnitIds = [...new Set(drivers.flatMap((driver) => {
+      const assignment = driver.driverProfile?.managementAssignments[0];
+      return [assignment?.teamUnitId, assignment?.managementUnitId].filter((id): id is number => typeof id === 'number');
+    }))];
+    const now = new Date();
+    const currentManagers = allManagementUnitIds.length
+      ? await this.prisma.managementUnitManagerAssignment.findMany({
+          where: { managementUnitId: { in: allManagementUnitIds }, managerType: 'PRIMARY', effectiveFrom: { lte: now }, OR: [{ effectiveTo: null }, { effectiveTo: { gt: now } }] },
+          include: { manager: { select: { id: true, code: true, fullName: true, phone: true } } },
+          orderBy: { effectiveFrom: 'desc' },
+        })
+      : [];
+    const managerByUnit = new Map(currentManagers.map((item) => [item.managementUnitId, item]));
     const search = filter.search?.trim().toLocaleLowerCase('vi-VN');
 
     const merged = drivers
       .map((driver) => {
         const employee = employeeByCode.get(driver.code) || null;
-        const defaultVehicle = driver.driverProfile?.vehicleAssignments[0]?.vehicle || driver.assignedVehicle || driver.drivenVehicles[0] || driver.secondaryVehicles[0] || null;
         const profile = driver.driverProfile;
+        const activeAssignments = profile?.vehicleAssignments || [];
+        const primaryAssignments = activeAssignments.filter((a) => a.type === 'PRIMARY');
+        const secondaryAssignments = activeAssignments.filter((a) => a.type === 'SECONDARY');
+        const defaultVehicle = primaryAssignments[0]?.vehicle || driver.assignedVehicle || driver.drivenVehicles[0] || driver.secondaryVehicles[0] || null;
+        const managementAssignment = profile?.managementAssignments[0] || null;
+        const teamManagerAssignment = managementAssignment?.teamUnitId ? managerByUnit.get(managementAssignment.teamUnitId) || null : null;
+        const ownerManagerAssignment = managementAssignment ? managerByUnit.get(managementAssignment.managementUnitId) || null : null;
+        const managerAssignment = teamManagerAssignment || ownerManagerAssignment || null;
+        const compliance = resolveDriverComplianceFields(driver, profile);
+
+        let licenses: any[] = [];
+        if (Array.isArray(profile?.licensesJson) && profile.licensesJson.length > 0) {
+          licenses = profile.licensesJson as any[];
+        } else if (compliance.licenseClass || compliance.licenseNumber) {
+          licenses = [{
+            category: compliance.licenseClass || 'GPLX',
+            number: compliance.licenseNumber || '',
+            issueDate: null,
+            expiryDate: compliance.licenseExpiryDate || null,
+            issuedBy: '',
+            isPrimary: true,
+          }];
+        }
+
         return {
           ...driver,
           ...(profile ? {
             employmentStatus: profile.employmentStatus,
             joinedDate: profile.joinedDate,
             resignedDate: profile.resignedDate,
-            licenseClass: profile.licenseClass,
-            licenseNumber: profile.licenseNumber,
-            licenseExpiryDate: profile.licenseExpiryDate,
-            healthCheckExpiryDate: profile.healthCheckExpiryDate,
             currentShiftStatus: profile.currentShiftStatus,
             currentLocation: profile.currentLocation,
           } : {}),
+          ...compliance,
           employee,
-          enterprise: employee?.enterprise || employee?.businessUnit || null,
-          team: employee?.team || employee?.farm || null,
+          managementAssignment,
+          managementUnit: managementAssignment?.managementUnit || null,
+          teamUnit: managementAssignment?.teamUnit || null,
+          management: managementAssignment ? {
+            assignment: managementAssignment,
+            unit: managementAssignment.managementUnit,
+            team: managementAssignment.teamUnit,
+            managerAssignment,
+            manager: managerAssignment?.manager || null,
+            teamManager: teamManagerAssignment?.manager || null,
+            ownerManager: ownerManagerAssignment?.manager || null,
+          } : null,
+          enterprise: managementAssignment?.managementUnit.name || null,
+          team: managementAssignment?.teamUnit?.name || null,
           position: employee?.position || null,
           assignedVehicle: defaultVehicle,
-          complianceStatus: this.getComplianceStatus(
-            driver.licenseNumber,
-            driver.licenseExpiryDate,
-            driver.healthCheckExpiryDate,
-          ),
+          assignedVehicles: activeAssignments.map((a) => ({
+            id: a.id,
+            vehicleId: a.vehicleId,
+            type: a.type,
+            vehicle: a.vehicle,
+          })),
+          primaryVehicles: primaryAssignments.map((a) => a.vehicle),
+          secondaryVehicles: secondaryAssignments.map((a) => a.vehicle),
+          licenses,
+          complianceStatus: getDriverComplianceStatus(compliance),
+          complex: this.resolveDriverComplexCode({
+            ...driver,
+            managementUnit: managementAssignment?.managementUnit,
+            employee,
+          }),
         };
       })
       .filter((item) => {
+        if (actor.role === Role.FARM_MANAGER) {
+          const assignment = item.managementAssignment;
+          if (!assignment || !allowedManagementUnitIdSet.has(assignment.managementUnitId)) return false;
+        }
         if (filter.complex || filter.complexCode) {
           const reqComp = (filter.complex || filter.complexCode || '').trim().toUpperCase();
           if (reqComp !== 'ALL') {
-            const empComp = (item.employee?.complex || '').toUpperCase();
+            const itemComp = this.resolveDriverComplexCode(item);
             const isMatch =
-              empComp === reqComp ||
-              (reqComp === 'KOUN_MOM' && (empComp.includes('KOUN') || empComp.includes('KM'))) ||
-              (reqComp === 'SNOUL' && (empComp.includes('SNOUL') || empComp.includes('SN'))) ||
-              (reqComp === 'NAM_LAO' && (empComp.includes('LAO') || empComp.includes('NL')));
+              itemComp === reqComp ||
+              (reqComp === 'KOUN_MOM' && itemComp === 'KOUN_MOM') ||
+              (reqComp === 'SNOUL' && itemComp === 'SNOUL') ||
+              (reqComp === 'NAM_LAO' && itemComp === 'NAM_LAO');
             if (!isMatch) return false;
           }
         }
         if (filter.unit && item.unit !== filter.unit) return false;
+        if (filter.managementUnitId && item.managementAssignment?.managementUnitId !== filter.managementUnitId) return false;
+        if (filter.teamUnitId && item.managementAssignment?.teamUnitId !== filter.teamUnitId) return false;
+        if (filter.managerUserId && item.management?.manager?.id !== filter.managerUserId) return false;
         if (filter.enterprise && item.enterprise !== filter.enterprise) return false;
         if (filter.team && item.team !== filter.team) return false;
         if (filter.position && item.position !== filter.position) return false;
         if (filter.employmentStatus && item.employmentStatus !== filter.employmentStatus) return false;
+        if (filter.shiftStatus && item.currentShiftStatus !== filter.shiftStatus) return false;
+        if (filter.complianceStatus && item.complianceStatus !== filter.complianceStatus) return false;
         if (!search) return true;
         return [
           item.code,
@@ -257,6 +411,8 @@ export class UsersService {
           item.team,
           item.position,
           item.unit,
+          item.licenseNumber,
+          item.licenseClass,
         ].some((value) => String(value || '').toLocaleLowerCase('vi-VN').includes(search));
       });
 
@@ -284,15 +440,24 @@ export class UsersService {
         inactive: merged.filter(
           (item) => item.employmentStatus === DriverEmploymentStatus.DA_NGHI_VIEC,
         ).length,
+        unassignedVehicle: merged.filter(
+          (item) => item.employmentStatus !== DriverEmploymentStatus.DA_NGHI_VIEC && !item.assignedVehicle,
+        ).length,
         complianceAlerts: merged.filter(
           (item) => item.complianceStatus !== 'VALID',
         ).length,
+        valid: merged.filter((item) => item.complianceStatus === 'VALID').length,
+        expiring30: merged.filter((item) => item.complianceStatus === 'EXPIRING_30').length,
+        expiring60: merged.filter((item) => item.complianceStatus === 'EXPIRING_60').length,
+        expired: merged.filter((item) => item.complianceStatus === 'EXPIRED').length,
+        missing: merged.filter((item) => item.complianceStatus === 'MISSING').length,
       },
     };
   }
 
-  async getDriverProfileOptions() {
-    const [employees, vehicles] = await Promise.all([
+  async getDriverProfileOptions(actor: OperationalActor) {
+    const allowedManagementUnitIds = await scopedManagementUnitIds(this.prisma, actor);
+    const [employees, vehicles, managementUnits] = await Promise.all([
       this.prisma.employeeRecord.findMany({
         select: {
           complex: true,
@@ -304,25 +469,53 @@ export class UsersService {
         },
       }),
       this.prisma.vehicle.findMany({
+        where: allowedManagementUnitIds ? { managementUnitId: { in: allowedManagementUnitIds } } : {},
         select: { id: true, code: true, plate: true, name: true, category: true, status: true },
         orderBy: { code: 'asc' },
       }),
+      this.prisma.driverManagementUnit?.findMany
+        ? this.prisma.driverManagementUnit.findMany({
+            where: {
+              status: 'ACTIVE',
+              ...(actor.role === Role.FARM_MANAGER
+                ? { OR: [{ id: { in: allowedManagementUnitIds ?? [] } }, { parentId: { in: allowedManagementUnitIds ?? [] } }] }
+                : {}),
+            },
+            include: {
+              parent: { select: { id: true, code: true, name: true } },
+              managerAssignments: {
+                where: {
+                  managerType: 'PRIMARY',
+                  effectiveFrom: { lte: new Date() },
+                  OR: [{ effectiveTo: null }, { effectiveTo: { gt: new Date() } }],
+                },
+                include: { manager: { select: { id: true, code: true, fullName: true, phone: true } } },
+                orderBy: { effectiveFrom: 'desc' },
+                take: 1,
+              },
+            },
+            orderBy: [{ complexCode: 'asc' }, { level: 'asc' }, { name: 'asc' }],
+          })
+        : Promise.resolve([]),
     ]);
     const unique = (values: Array<string | null | undefined>) =>
       [...new Set(values.map((value) => value?.trim()).filter((value): value is string => Boolean(value)))].sort();
 
     return {
-      complexes: unique(employees.map((item) => item.complex)),
+      complexes: actor.role === Role.FARM_MANAGER
+        ? unique(managementUnits.filter((item) => item.level === DriverManagementLevel.OWNER).map((item) => item.complexCode))
+        : unique(employees.map((item) => item.complex)),
       enterprises: unique(employees.flatMap((item) => [item.enterprise, item.businessUnit])),
       farms: unique(employees.map((item) => item.farm)),
       teams: unique(employees.map((item) => item.team)),
       positions: unique(employees.map((item) => item.position)),
       units: Object.values(Unit),
       vehicles,
+      managementUnits,
     };
   }
 
-  async findDriverProfile(id: number) {
+  async findDriverProfile(id: number, actor?: OperationalActor) {
     const driver = await this.prisma.user.findFirst({
       where: { id, role: Role.DRIVER },
       select: {
@@ -352,6 +545,7 @@ export class UsersService {
           include: {
             vehicleAssignments: { include: { vehicle: true, assignedBy: { select: { id: true, fullName: true } } }, orderBy: { effectiveFrom: 'desc' } },
             unavailability: { orderBy: { startAt: 'desc' }, take: 20 },
+            managementAssignments: { include: { managementUnit: true, teamUnit: true, assignedBy: { select: { id: true, code: true, fullName: true } } }, orderBy: { effectiveFrom: 'desc' } },
           },
         },
         assignedVehicle: true,
@@ -393,16 +587,69 @@ export class UsersService {
       throw new NotFoundException(`Không tìm thấy hồ sơ lái xe #${id}`);
     }
 
-    const employee = await this.prisma.employeeRecord.findUnique({
-      where: { empCode: driver.code },
-    });
+    if (actor?.role === Role.DRIVER && actor.id !== id) {
+      throw new ForbiddenException('Tài xế chỉ được xem hồ sơ của chính mình.');
+    }
+
+    if (actor?.role === Role.FARM_MANAGER) {
+      const now = new Date();
+      const currentAssignment = driver.driverProfile?.managementAssignments.find((item) => item.effectiveFrom <= now && (!item.effectiveTo || item.effectiveTo > now));
+      const scopes = await this.prisma.driverManagementAccessScope.findMany({ where: { userId: actor.id } });
+      if (!currentAssignment || !scopes.some((scope) => scope.complexCode === currentAssignment.managementUnit.complexCode && (!scope.managementUnitId || scope.managementUnitId === currentAssignment.managementUnitId))) {
+        throw new ForbiddenException('Không được xem hồ sơ tài xế ngoài phạm vi quản lý được cấp.');
+      }
+    }
 
     const profile = driver.driverProfile;
-    const complianceStatus = this.getComplianceStatus(
-      profile?.licenseNumber ?? driver.licenseNumber,
-      profile?.licenseExpiryDate ?? driver.licenseExpiryDate,
-      profile?.healthCheckExpiryDate ?? driver.healthCheckExpiryDate,
-    );
+    const profileNow = new Date();
+    const currentManagementAssignment = profile?.managementAssignments.find((item) => item.effectiveFrom <= profileNow && (!item.effectiveTo || item.effectiveTo > profileNow)) || null;
+    const [employee, directTeamManager, directOwnerManager] = await Promise.all([
+      this.prisma.employeeRecord.findUnique({ where: { empCode: driver.code } }),
+      currentManagementAssignment?.teamUnitId
+        ? this.prisma.managementUnitManagerAssignment.findFirst({
+            where: {
+              managementUnitId: currentManagementAssignment.teamUnitId,
+              managerType: 'PRIMARY',
+              effectiveFrom: { lte: profileNow },
+              OR: [{ effectiveTo: null }, { effectiveTo: { gt: profileNow } }],
+            },
+            include: { manager: { select: { id: true, code: true, fullName: true, phone: true } } },
+            orderBy: { effectiveFrom: 'desc' },
+          })
+        : Promise.resolve(null),
+      currentManagementAssignment?.managementUnitId
+        ? this.prisma.managementUnitManagerAssignment.findFirst({
+            where: {
+              managementUnitId: currentManagementAssignment.managementUnitId,
+              managerType: 'PRIMARY',
+              effectiveFrom: { lte: profileNow },
+              OR: [{ effectiveTo: null }, { effectiveTo: { gt: profileNow } }],
+            },
+            include: { manager: { select: { id: true, code: true, fullName: true, phone: true } } },
+            orderBy: { effectiveFrom: 'desc' },
+          })
+        : Promise.resolve(null),
+    ]);
+    const directManager = directTeamManager || directOwnerManager;
+    const compliance = resolveDriverComplianceFields(driver, profile);
+    const complianceStatus = getDriverComplianceStatus(compliance);
+    const activeAssignments = (profile?.vehicleAssignments || []).filter((a) => a.status === 'ACTIVE');
+    const primaryAssignments = activeAssignments.filter((a) => a.type === 'PRIMARY');
+    const secondaryAssignments = activeAssignments.filter((a) => a.type === 'SECONDARY');
+
+    let licenses: any[] = [];
+    if (Array.isArray(profile?.licensesJson) && profile.licensesJson.length > 0) {
+      licenses = profile.licensesJson as any[];
+    } else if (compliance.licenseClass || compliance.licenseNumber) {
+      licenses = [{
+        category: compliance.licenseClass || 'GPLX',
+        number: compliance.licenseNumber || '',
+        issueDate: null,
+        expiryDate: compliance.licenseExpiryDate || null,
+        issuedBy: '',
+        isPrimary: true,
+      }];
+    }
 
     return {
       ...driver,
@@ -411,20 +658,37 @@ export class UsersService {
         joinedDate: profile.joinedDate,
         resignedDate: profile.resignedDate,
         resignedReason: profile.resignedReason,
-        licenseClass: profile.licenseClass,
-        licenseNumber: profile.licenseNumber,
-        licenseExpiryDate: profile.licenseExpiryDate,
-        healthCheckExpiryDate: profile.healthCheckExpiryDate,
         currentShiftStatus: profile.currentShiftStatus,
         currentLocation: profile.currentLocation,
         vehicleAssignmentHistory: profile.vehicleAssignments,
         unavailability: profile.unavailability,
+        managementAssignment: currentManagementAssignment,
+        managementAssignmentHistory: profile.managementAssignments,
+        management: currentManagementAssignment ? {
+          assignment: currentManagementAssignment,
+          unit: currentManagementAssignment.managementUnit,
+          team: currentManagementAssignment.teamUnit,
+          managerAssignment: directManager,
+          manager: directManager?.manager || null,
+          teamManager: directTeamManager?.manager || null,
+          ownerManager: directOwnerManager?.manager || null,
+        } : null,
       } : {}),
+      ...compliance,
+      licenses,
+      assignedVehicles: activeAssignments.map((a) => ({
+        id: a.id,
+        vehicleId: a.vehicleId,
+        type: a.type,
+        vehicle: a.vehicle,
+      })),
+      primaryVehicles: primaryAssignments.map((a) => a.vehicle),
+      secondaryVehicles: secondaryAssignments.map((a) => a.vehicle),
       employee,
       complianceStatus,
       dataAvailability: {
         personalProfile: Boolean(employee),
-        multipleCredentials: false,
+        multipleCredentials: licenses.length > 1,
         safetyTraining: false,
         vehicleAssignmentHistory: Boolean(profile?.vehicleAssignments.length),
         documents: false,
@@ -433,7 +697,7 @@ export class UsersService {
     };
   }
 
-  async createDriverProfile(dto: CreateDriverProfileDto) {
+  async createDriverProfile(dto: CreateDriverProfileDto, actor?: OperationalActor) {
     const [existingUsername, existingCode] = await Promise.all([
       this.prisma.user.findUnique({ where: { username: dto.username } }),
       this.prisma.user.findUnique({ where: { code: dto.code } }),
@@ -441,7 +705,27 @@ export class UsersService {
     if (existingUsername) throw new ConflictException('Tên đăng nhập đã tồn tại');
     if (existingCode) throw new ConflictException('Mã nhân sự đã tồn tại');
 
-    const rawPassword = dto.password?.trim() || '123456';
+    const managementSelection = actor
+      ? await this.resolveDriverManagementSelection(
+          dto.managementUnitId,
+          dto.teamUnitId,
+          actor,
+          false,
+        )
+      : null;
+
+    if (dto.licenses && dto.licenses.length > 0) {
+      const primaryLicense = dto.licenses.find((l: any) => l.isPrimary) || dto.licenses[0];
+      if (primaryLicense) {
+        dto.licenseClass = dto.licenseClass || primaryLicense.category;
+        dto.licenseNumber = dto.licenseNumber || primaryLicense.number;
+        if (!dto.licenseExpiryDate && primaryLicense.expiryDate) {
+          dto.licenseExpiryDate = primaryLicense.expiryDate;
+        }
+      }
+    }
+
+    const rawPassword = dto.password?.trim() || 'Thaco@1234$';
     const passwordHash = await bcrypt.hash(rawPassword, 10);
     const userData = this.pickDriverUserData(dto);
     const employeeData = this.pickEmployeeData(dto);
@@ -473,18 +757,78 @@ export class UsersService {
 
       await tx.driverProfile.create({ data: { userId: driver.id, ...this.pickDriverProfileData(dto) } });
 
+      const assignmentsToSync = dto.assignedVehicles && dto.assignedVehicles.length > 0
+        ? dto.assignedVehicles
+        : (dto.assignedVehicleIds && dto.assignedVehicleIds.length > 0
+            ? dto.assignedVehicleIds.map((vId) => ({ vehicleId: vId, type: VehicleDriverAssignmentType.PRIMARY }))
+            : (dto.assignedVehicleId ? [{ vehicleId: dto.assignedVehicleId, type: VehicleDriverAssignmentType.PRIMARY }] : []));
+      if (assignmentsToSync.length > 0) {
+        await this.syncDriverVehicleAssignments(tx, driver.id, assignmentsToSync, actor?.id ?? driver.id);
+      }
+
+      if (managementSelection && tx.driverManagementAssignment) {
+        await tx.driverManagementAssignment.create({
+          data: {
+            driverId: driver.id,
+            managementUnitId: managementSelection.owner.id,
+            teamUnitId: managementSelection.teamUnitId,
+            effectiveFrom: new Date(),
+            reason: 'Tiếp nhận tài xế mới',
+            assignedById: actor?.id ?? driver.id,
+          },
+        });
+      }
+
       return driver.id;
     });
-    return this.findDriverProfile(driverId);
+    return this.findDriverProfile(driverId, actor);
   }
 
-  async updateDriverProfile(id: number, dto: UpdateDriverProfileDto) {
-    const current = await this.prisma.user.findFirst({ where: { id, role: Role.DRIVER } });
+  async updateDriverProfile(id: number, dto: UpdateDriverProfileDto, actor: OperationalActor) {
+    const current = await this.prisma.user.findFirst({
+      where: { id, role: Role.DRIVER },
+      include: {
+        driverProfile: {
+          include: {
+            managementAssignments: {
+              where: { effectiveTo: null },
+              take: 1,
+            },
+          },
+        },
+      },
+    });
     if (!current) throw new NotFoundException(`Không tìm thấy hồ sơ lái xe #${id}`);
+    if (actor.role !== Role.SUPER_ADMIN && actor.role !== Role.FARM_MANAGER) {
+      throw new ForbiddenException('Chỉ Quản trị viên hoặc Quản lý nông trường được cập nhật hồ sơ GPLX.');
+    }
+    if (!hasGlobalOperationalAccess(actor) && current.unit !== actor.unit) {
+      throw new ForbiddenException('Không được cập nhật hồ sơ tài xế ngoài đơn vị được phân quyền.');
+    }
 
     if (dto.username && dto.username !== current.username) {
       const duplicate = await this.prisma.user.findUnique({ where: { username: dto.username } });
       if (duplicate) throw new ConflictException('Tên đăng nhập đã tồn tại');
+    }
+
+    let managementSelection: { owner: any; teamUnitId: number | null } | null | undefined = undefined;
+    if (dto.managementUnitId !== undefined) {
+      managementSelection = await this.resolveDriverManagementSelection(
+        dto.managementUnitId || undefined,
+        dto.teamUnitId || undefined,
+        actor,
+      );
+    }
+
+    if (dto.licenses && dto.licenses.length > 0) {
+      const primaryLicense = dto.licenses.find((l: any) => l.isPrimary) || dto.licenses[0];
+      if (primaryLicense) {
+        dto.licenseClass = dto.licenseClass || primaryLicense.category;
+        dto.licenseNumber = dto.licenseNumber || primaryLicense.number;
+        if (!dto.licenseExpiryDate && primaryLicense.expiryDate) {
+          dto.licenseExpiryDate = primaryLicense.expiryDate;
+        }
+      }
     }
 
     const userData = this.pickDriverUserData(dto);
@@ -516,15 +860,63 @@ export class UsersService {
         },
       });
       await tx.driverProfile.upsert({ where: { userId: id }, create: { userId: id, ...this.pickDriverProfileData({ ...current, ...dto } as any) }, update: this.pickDriverProfileData(dto) });
+
+      let assignmentsToSync: Array<{ vehicleId: number; type: VehicleDriverAssignmentType }> | null = null;
+      if (dto.assignedVehicles !== undefined) {
+        assignmentsToSync = dto.assignedVehicles;
+      } else if (dto.assignedVehicleIds !== undefined) {
+        assignmentsToSync = dto.assignedVehicleIds.map((vId) => ({ vehicleId: vId, type: VehicleDriverAssignmentType.PRIMARY }));
+      } else if (dto.assignedVehicleId !== undefined) {
+        assignmentsToSync = dto.assignedVehicleId ? [{ vehicleId: dto.assignedVehicleId, type: VehicleDriverAssignmentType.PRIMARY }] : [];
+      }
+      if (assignmentsToSync !== null) {
+        await this.syncDriverVehicleAssignments(tx, id, assignmentsToSync, actor.id);
+      }
+
+      if (managementSelection !== undefined && tx.driverManagementAssignment) {
+        const currentActive = current.driverProfile?.managementAssignments?.[0];
+        const isSame = currentActive &&
+          currentActive.managementUnitId === (managementSelection?.owner.id ?? null) &&
+          currentActive.teamUnitId === (managementSelection?.teamUnitId ?? null);
+
+        if (!isSame) {
+          await tx.driverManagementAssignment.updateMany({
+            where: { driverId: id, effectiveTo: null },
+            data: { effectiveTo: new Date() },
+          });
+
+          if (managementSelection) {
+            await tx.driverManagementAssignment.create({
+              data: {
+                driverId: id,
+                managementUnitId: managementSelection.owner.id,
+                teamUnitId: managementSelection.teamUnitId,
+                effectiveFrom: new Date(),
+                reason: 'Cập nhật cơ cấu đơn vị quản lý hồ sơ',
+                assignedById: actor.id,
+              },
+            });
+          }
+        }
+      }
     });
 
-    return this.findDriverProfile(id);
+    this.alertsService?.invalidateSourceCache();
+    return this.findDriverProfile(id, actor);
   }
 
   private pickDriverUserData(dto: UpdateDriverProfileDto | CreateDriverProfileDto): any {
+    const isActive =
+      dto.isActive !== undefined
+        ? dto.isActive
+        : dto.employmentStatus !== undefined
+        ? dto.employmentStatus === DriverEmploymentStatus.DANG_LAM_VIEC
+        : undefined;
+
     return {
       ...(dto.phone !== undefined ? { phone: dto.phone || null } : {}),
       ...(dto.employmentStatus !== undefined ? { employmentStatus: dto.employmentStatus } : {}),
+      ...(isActive !== undefined ? { isActive } : {}),
       ...(dto.joinedDate !== undefined ? { joinedDate: new Date(dto.joinedDate) } : {}),
       ...(dto.resignedDate !== undefined ? { resignedDate: dto.resignedDate ? new Date(dto.resignedDate) : null } : {}),
       ...(dto.resignedReason !== undefined ? { resignedReason: dto.resignedReason || null } : {}),
@@ -552,6 +944,7 @@ export class UsersService {
       ...(dto.healthCheckExpiryDate !== undefined ? { healthCheckExpiryDate: dto.healthCheckExpiryDate ? new Date(dto.healthCheckExpiryDate) : null } : {}),
       ...(dto.currentShiftStatus !== undefined ? { currentShiftStatus: dto.currentShiftStatus || DriverShiftStatus.SAN_SANG } : {}),
       ...(dto.currentLocation !== undefined ? { currentLocation: dto.currentLocation || null } : {}),
+      ...(dto.licenses !== undefined ? { licensesJson: dto.licenses } : {}),
     };
   }
 
@@ -574,6 +967,92 @@ export class UsersService {
       ...(dto.licenseExpiryDate !== undefined ? { licenseExpiryDate: dto.licenseExpiryDate || null } : {}),
       ...(dto.healthCheckExpiryDate !== undefined ? { healthCheckExpiryDate: dto.healthCheckExpiryDate || null } : {}),
     };
+  }
+
+  private async syncDriverVehicleAssignments(
+    tx: Prisma.TransactionClient,
+    driverId: number,
+    assignedVehicles: Array<{ vehicleId: number; type: VehicleDriverAssignmentType }>,
+    actorId: number,
+  ) {
+    const primaryCount = assignedVehicles.filter((v) => v.type === VehicleDriverAssignmentType.PRIMARY).length;
+    const secondaryCount = assignedVehicles.filter((v) => v.type === VehicleDriverAssignmentType.SECONDARY).length;
+    if (primaryCount > 2) {
+      throw new BadRequestException('Mỗi tài xế chỉ được phụ trách chính tối đa 2 xe.');
+    }
+    if (secondaryCount > 2) {
+      throw new BadRequestException('Mỗi tài xế chỉ được phụ trách phụ tối đa 2 xe.');
+    }
+
+    const currentAssignments = await tx.vehicleDriverAssignment.findMany({
+      where: { driverId, status: VehicleDriverAssignmentStatus.ACTIVE },
+    });
+
+    const targetMap = new Map<number, VehicleDriverAssignmentType>();
+    for (const item of assignedVehicles) {
+      targetMap.set(item.vehicleId, item.type);
+    }
+
+    const now = new Date();
+
+    for (const cur of currentAssignments) {
+      const targetType = targetMap.get(cur.vehicleId);
+      if (!targetType || targetType !== cur.type) {
+        await tx.vehicleDriverAssignment.update({
+          where: { id: cur.id },
+          data: { status: VehicleDriverAssignmentStatus.ENDED, effectiveTo: now, reason: 'Điều chỉnh phân công quản lý xe' },
+        });
+        if (cur.type === VehicleDriverAssignmentType.PRIMARY) {
+          await tx.vehicle.updateMany({
+            where: { id: cur.vehicleId, defaultDriverId: driverId },
+            data: { defaultDriverId: null },
+          });
+        }
+      }
+    }
+
+    for (const target of assignedVehicles) {
+      const existing = currentAssignments.find((c) => c.vehicleId === target.vehicleId && c.type === target.type);
+      if (!existing) {
+        if (target.type === VehicleDriverAssignmentType.PRIMARY) {
+          const conflicting = await tx.vehicleDriverAssignment.findFirst({
+            where: {
+              vehicleId: target.vehicleId,
+              type: VehicleDriverAssignmentType.PRIMARY,
+              status: VehicleDriverAssignmentStatus.ACTIVE,
+              driverId: { not: driverId },
+            },
+          });
+          if (conflicting) {
+            throw new ConflictException(`Xe #${target.vehicleId} đã có tài xế khác phụ trách chính.`);
+          }
+        }
+
+        await tx.vehicleDriverAssignment.create({
+          data: {
+            vehicleId: target.vehicleId,
+            driverId,
+            type: target.type,
+            status: VehicleDriverAssignmentStatus.ACTIVE,
+            effectiveFrom: now,
+            assignedById: actorId,
+            reason: 'Phân công quản lý xe',
+          },
+        });
+        if (target.type === VehicleDriverAssignmentType.PRIMARY) {
+          await tx.vehicle.update({
+            where: { id: target.vehicleId },
+            data: { defaultDriverId: driverId },
+          });
+        }
+      }
+    }
+
+    const primaryVehicle = assignedVehicles.find((v) => v.type === VehicleDriverAssignmentType.PRIMARY);
+    await tx.user.update({
+      where: { id: driverId },
+      data: { assignedVehicleId: primaryVehicle ? primaryVehicle.vehicleId : null },
+    });
   }
 
   async findOne(id: number) {
@@ -632,6 +1111,10 @@ export class UsersService {
       data.passwordHash = await bcrypt.hash(dto.password, salt);
     }
 
+    if (user.username === 'admin') {
+      data.isActive = true;
+    }
+
     return this.prisma.user.update({
       where: { id },
       data,
@@ -650,7 +1133,10 @@ export class UsersService {
   }
 
   async remove(id: number) {
-    await this.findOne(id);
+    const user = await this.findOne(id);
+    if (user.username === 'admin') {
+      throw new BadRequestException('Không thể vô hiệu hóa hoặc xóa tài khoản Quản trị viên hệ thống (Admin).');
+    }
     return this.prisma.user.update({
       where: { id },
       data: { isActive: false },
