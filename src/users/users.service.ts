@@ -395,7 +395,7 @@ export class UsersService {
           secondaryVehicles: secondaryAssignments.map((a) => a.vehicle),
           licenses,
           complianceStatus: getDriverComplianceStatus(compliance),
-          complex: this.resolveDriverComplexCode({
+          complex: managementAssignment?.managementUnit.complexCode || activeAssignments[0]?.vehicle.complexCode || this.resolveDriverComplexCode({
             ...driver,
             managementUnit: managementAssignment?.managementUnit,
             employee,
